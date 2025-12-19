@@ -1,3 +1,5 @@
+// === 1. SERVER.JS (Updated with WebSocket Support) ===
+
 import express from "express";
 import cors from "cors";
 import multer from "multer";
@@ -11,6 +13,7 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 app.use(cors());
+app.use(express.json());
 app.use("/api/auth", authRoutes);
 
 const KEYFILEPATH = path.join(process.cwd(), "gdrive-key.json");
@@ -21,7 +24,6 @@ const auth = new google.auth.GoogleAuth({
   keyFile: KEYFILEPATH,
   scopes: SCOPES,
 });
-
 const drive = google.drive({ version: "v3", auth });
 
 const upload = multer({ dest: "uploads/" });
@@ -30,31 +32,28 @@ let pendingJobs = [];
 let activeJobs = [];
 let completedJobs = [];
 
+// WebSocket setup
 const wss = new WebSocketServer({ noServer: true });
 let clients = [];
 
 wss.on("connection", (ws) => {
   clients.push(ws);
   ws.on("close", () => {
-    clients = clients.filter((c) => c !== ws);
+    clients = clients.filter((client) => client !== ws);
   });
 });
 
 function broadcastLog(job_id, message) {
-  const payload = JSON.stringify({
-    jobId: job_id,
-    log: message,
-  });
-
+  const payload = JSON.stringify({ job_id, message });
   clients.forEach((client) => {
-    if (client.readyState === 1) {
-      client.send(payload);
-    }
+    if (client.readyState === 1) client.send(payload);
   });
 }
 
+// Expose broadcast function to index.js via global
 global.broadcastLog = broadcastLog;
 
+// Upgrade HTTP -> WS
 const server = app.listen(PORT, () => {
   console.log(`MacBridge API running on port ${PORT}`);
 });
@@ -65,14 +64,11 @@ server.on("upgrade", (req, socket, head) => {
   });
 });
 
+// ==== Remaining routes (unchanged logic, but cleaner logs) ====
+
 app.get("/jobs/next", (req, res) => {
-  if (pendingJobs.length === 0) {
-    return res.json({ job_id: null });
-  }
-
+  if (pendingJobs.length === 0) return res.json({ job_id: null });
   const job = pendingJobs.shift();
-  activeJobs.push(job); 
-
   console.log("[Server] Job sent to agent:", job.job_id);
   res.json(job);
 });
@@ -90,75 +86,45 @@ app.post("/jobs/result", (req, res) => {
     email,
     timestamp: new Date().toISOString(),
   });
-
   activeJobs = activeJobs.filter((j) => j.job_id !== job_id);
-
   res.json({ message: "Result received" });
 });
 
 app.post("/jobs/upload", upload.single("job"), async (req, res) => {
   try {
-    const {
-      build_mode = "simulator",
-      webhook_url = null,
-      email = "anonymous@example.com",
-    } = req.body;
-
-    if (!req.file) {
-      return res.status(400).json({ error: "No file uploaded" });
-    }
+    const { build_mode = "simulator", webhook_url = null, email = "anonymous@example.com" } = req.body;
 
     const filePath = req.file.path;
-
     const fileMetadata = {
       name: req.file.originalname,
       parents: [DRIVE_FOLDER_ID],
     };
-
     const media = {
       mimeType: "application/zip",
       body: fs.createReadStream(filePath),
     };
 
-    const driveResponse = await drive.files.create({
-      resource: fileMetadata,
-      media,
-      fields: "id",
-    });
-
+    const driveResponse = await drive.files.create({ resource: fileMetadata, media, fields: "id" });
     const fileId = driveResponse.data.id;
     const downloadUrl = `https://drive.google.com/uc?id=${fileId}&export=download`;
     const jobId = `job_${Date.now()}`;
 
-    const jobData = {
-      job_id: jobId,
-      zip_url: downloadUrl,
-      build_mode,
-      webhook_url,
-      email,
-    };
-
-    pendingJobs.push(jobData); 
+    const jobData = { job_id: jobId, zip_url: downloadUrl, build_mode, webhook_url, email };
+    pendingJobs.push(jobData);
+    activeJobs.push(jobData);
 
     console.log("[Server] New Job Added:", jobId, "for", email);
-
     fs.unlinkSync(filePath);
-
     res.json({ message: "Job uploaded", job_id: jobId });
   } catch (err) {
-    console.error("Upload error:", err);
+    console.error("Upload error:", err.message);
     res.status(500).json({ error: "Failed to upload job" });
   }
 });
 
 app.get("/jobs/history", (req, res) => {
   const { email } = req.query;
-  if (!email) {
-    return res.status(400).json({ message: "Missing email" });
-  }
-
+  if (!email) return res.status(400).json({ message: "Missing email" });
   const jobs = completedJobs.filter((j) => j.email === email);
   res.json({ jobs });
 });
-
-app.use(express.json());

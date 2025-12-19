@@ -1,3 +1,6 @@
+import dotenv from 'dotenv';
+dotenv.config();  // Load .env for local dev
+
 import express from "express";
 import cors from "cors";
 import multer from "multer";
@@ -14,9 +17,12 @@ app.use(cors());
 app.use(express.json());
 app.use("/api/auth", authRoutes);
 
-// Google Auth with env var (recommended)
+// Google Auth with env var
 let drive;
 try {
+  if (!process.env.GOOGLE_DRIVE_KEY) {
+    throw new Error("GOOGLE_DRIVE_KEY environment variable is not set");
+  }
   const credentials = JSON.parse(process.env.GOOGLE_DRIVE_KEY);
   const auth = new google.auth.GoogleAuth({
     credentials,
@@ -26,22 +32,20 @@ try {
   console.log("[Auth] Google Drive client initialized successfully");
 } catch (err) {
   console.error("[Auth] Failed to initialize Google Drive:", err.message);
-  // App can still run, but uploads will fail
+  // Continue running (uploads will fail gracefully)
 }
 
 const DRIVE_FOLDER_ID = "1olOvZZbvGuyzoB-9L1d8sZXe9iEzauOA";
 
-// Multer with size limit (100MB) to prevent timeouts
 const upload = multer({
   dest: "uploads/",
-  limits: { fileSize: 100 * 1024 * 1024 }, // 100MB
+  limits: { fileSize: 100 * 1024 * 1024 },
 });
 
 let pendingJobs = [];
 let activeJobs = [];
 let completedJobs = [];
 
-// WebSocket setup
 const wss = new WebSocketServer({ noServer: true });
 let clients = [];
 
@@ -61,7 +65,6 @@ function broadcastLog(job_id, message) {
 
 global.broadcastLog = broadcastLog;
 
-// Server
 const server = app.listen(PORT, () => {
   console.log(`MacBridge API running on port ${PORT}`);
 });
@@ -72,13 +75,14 @@ server.on("upgrade", (req, socket, head) => {
   });
 });
 
-// Global error handler
 app.use((err, req, res, next) => {
   console.error("[Global Error]", err.stack);
   res.status(500).json({ error: "Internal server error" });
 });
 
-// Routes
+// Your other routes remain the same (get/next, post/result, post/upload, get/history)
+// In /jobs/upload, keep the check: if (!drive) throw new Error("Google Drive client not initialized");
+
 app.get("/jobs/next", (req, res) => {
   if (pendingJobs.length === 0) return res.json({ job_id: null });
   const job = pendingJobs.shift();
@@ -107,9 +111,9 @@ app.post("/jobs/upload", upload.single("job"), async (req, res) => {
   try {
     if (!drive) throw new Error("Google Drive client not initialized");
 
-    const { build_mode = "simulator", webhook_url = null, email = "anonymous@example.com" } = req.body;
-
     if (!req.file) throw new Error("No file uploaded");
+
+    const { build_mode = "simulator", webhook_url = null, email = "anonymous@example.com" } = req.body;
 
     const filePath = req.file.path;
     console.log("[Upload] File received:", filePath, "size:", req.file.size);

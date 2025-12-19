@@ -1,5 +1,5 @@
 import dotenv from 'dotenv';
-dotenv.config();  // Load .env for local dev
+dotenv.config();  // Load .env for local dev (optional on Render)
 
 import express from "express";
 import cors from "cors";
@@ -17,35 +17,41 @@ app.use(cors());
 app.use(express.json());
 app.use("/api/auth", authRoutes);
 
-// Google Auth with env var
+// Google Auth - Use SECRET FILE on Render for reliability with complex keys
+// This avoids any JSON string escaping issues in env vars
 let drive;
 try {
-  if (!process.env.GOOGLE_DRIVE_KEY) {
-    throw new Error("GOOGLE_DRIVE_KEY environment variable is not set");
+  const KEYFILEPATH = "/etc/secrets/gdrive-key.json";  // Render mounts secret files here
+
+  if (!fs.existsSync(KEYFILEPATH)) {
+    throw new Error("Secret file gdrive-key.json not found at /etc/secrets/");
   }
-  const credentials = JSON.parse(process.env.GOOGLE_DRIVE_KEY);
+
   const auth = new google.auth.GoogleAuth({
-    credentials,
+    keyFile: KEYFILEPATH,
     scopes: ["https://www.googleapis.com/auth/drive"],
   });
+
   drive = google.drive({ version: "v3", auth });
-  console.log("[Auth] Google Drive client initialized successfully");
+  console.log("[Auth] Google Drive client initialized successfully from secret file");
 } catch (err) {
   console.error("[Auth] Failed to initialize Google Drive:", err.message);
-  // Continue running (uploads will fail gracefully)
+  // App continues running; uploads will fail with clear error
 }
 
 const DRIVE_FOLDER_ID = "1olOvZZbvGuyzoB-9L1d8sZXe9iEzauOA";
 
+// Multer config with size limit
 const upload = multer({
   dest: "uploads/",
-  limits: { fileSize: 100 * 1024 * 1024 },
+  limits: { fileSize: 100 * 1024 * 1024 },  // 100MB max
 });
 
 let pendingJobs = [];
 let activeJobs = [];
 let completedJobs = [];
 
+// WebSocket setup
 const wss = new WebSocketServer({ noServer: true });
 let clients = [];
 
@@ -65,6 +71,7 @@ function broadcastLog(job_id, message) {
 
 global.broadcastLog = broadcastLog;
 
+// HTTP server
 const server = app.listen(PORT, () => {
   console.log(`MacBridge API running on port ${PORT}`);
 });
@@ -75,14 +82,13 @@ server.on("upgrade", (req, socket, head) => {
   });
 });
 
+// Global error handler
 app.use((err, req, res, next) => {
   console.error("[Global Error]", err.stack);
   res.status(500).json({ error: "Internal server error" });
 });
 
-// Your other routes remain the same (get/next, post/result, post/upload, get/history)
-// In /jobs/upload, keep the check: if (!drive) throw new Error("Google Drive client not initialized");
-
+// Routes
 app.get("/jobs/next", (req, res) => {
   if (pendingJobs.length === 0) return res.json({ job_id: null });
   const job = pendingJobs.shift();
@@ -129,6 +135,13 @@ app.post("/jobs/upload", upload.single("job"), async (req, res) => {
 
     const driveResponse = await drive.files.create({ resource: fileMetadata, media, fields: "id" });
     const fileId = driveResponse.data.id;
+
+    // Make file publicly downloadable
+    await drive.permissions.create({
+      fileId,
+      requestBody: { role: "reader", type: "anyone" },
+    });
+
     const downloadUrl = `https://drive.google.com/uc?id=${fileId}&export=download`;
     const jobId = `job_${Date.now()}`;
 

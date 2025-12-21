@@ -1,166 +1,163 @@
-import dotenv from 'dotenv';
-dotenv.config();  // Load .env for local dev (optional on Render)
+import dotenv from "dotenv";
+dotenv.config();
 
 import express from "express";
 import cors from "cors";
 import multer from "multer";
-import { google } from "googleapis";
-import path from "path";
 import fs from "fs";
+import path from "path";
+import { google } from "googleapis";
 import authRoutes from "./routes/auth.js";
-import { WebSocketServer } from "ws";
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-app.use(cors());
+/* =======================
+   Middleware
+======================= */
+app.use(cors({
+  origin: "*",
+  methods: ["GET", "POST"],
+}));
 app.use(express.json());
+
 app.use("/api/auth", authRoutes);
 
-// Google Auth - Use SECRET FILE on Render for reliability with complex keys
-// This avoids any JSON string escaping issues in env vars
+/* =======================
+   Ensure folders exist
+======================= */
+["uploads"].forEach(dir => {
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir);
+});
+
+/* =======================
+   Google Drive
+======================= */
 let drive;
+const KEYFILEPATH = "/etc/secrets/gdrive-key.json";
+const DRIVE_FOLDER_ID = "1olOvZZbvGuyzoB-9L1d8sZXe9iEzauOA";
+
 try {
-  const KEYFILEPATH = "/etc/secrets/gdrive-key.json";  // Render mounts secret files here
-
-  if (!fs.existsSync(KEYFILEPATH)) {
-    throw new Error("Secret file gdrive-key.json not found at /etc/secrets/");
-  }
-
   const auth = new google.auth.GoogleAuth({
     keyFile: KEYFILEPATH,
     scopes: ["https://www.googleapis.com/auth/drive"],
   });
-
   drive = google.drive({ version: "v3", auth });
-  console.log("[Auth] Google Drive client initialized successfully from secret file");
-} catch (err) {
-  console.error("[Auth] Failed to initialize Google Drive:", err.message);
-  // App continues running; uploads will fail with clear error
+  console.log("✅ Google Drive initialized");
+} catch (e) {
+  console.error("❌ Google Drive init failed:", e.message);
 }
 
-const DRIVE_FOLDER_ID = "1olOvZZbvGuyzoB-9L1d8sZXe9iEzauOA";
-
-// Multer config with size limit
+/* =======================
+   Multer
+======================= */
 const upload = multer({
-  dest: "uploads/",
-  limits: { fileSize: 100 * 1024 * 1024 },  // 100MB max
+  storage: multer.diskStorage({
+    destination: "uploads/",
+    filename: (_, file, cb) => cb(null, `${Date.now()}-${file.originalname}`)
+  }),
+  limits: { fileSize: 100 * 1024 * 1024 }
 });
 
+/* =======================
+   Job Queues
+======================= */
 let pendingJobs = [];
 let activeJobs = [];
 let completedJobs = [];
 
-// WebSocket setup
-const wss = new WebSocketServer({ noServer: true });
-let clients = [];
+/* =======================
+   ROUTES
+======================= */
 
-wss.on("connection", (ws) => {
-  clients.push(ws);
-  ws.on("close", () => {
-    clients = clients.filter((client) => client !== ws);
-  });
-});
-
-function broadcastLog(job_id, message) {
-  const payload = JSON.stringify({ job_id, message });
-  clients.forEach((client) => {
-    if (client.readyState === 1) client.send(payload);
-  });
-}
-
-global.broadcastLog = broadcastLog;
-
-// HTTP server
-const server = app.listen(PORT, () => {
-  console.log(`MacBridge API running on port ${PORT}`);
-});
-
-server.on("upgrade", (req, socket, head) => {
-  wss.handleUpgrade(req, socket, head, (ws) => {
-    wss.emit("connection", ws, req);
-  });
-});
-
-// Global error handler
-app.use((err, req, res, next) => {
-  console.error("[Global Error]", err.stack);
-  res.status(500).json({ error: "Internal server error" });
-});
-
-// Routes
+// ✅ Agent polls this
 app.get("/jobs/next", (req, res) => {
-  if (pendingJobs.length === 0) return res.json({ job_id: null });
+  if (!pendingJobs.length) {
+    return res.json({ job_id: null });
+  }
   const job = pendingJobs.shift();
-  console.log("[Server] Job sent to agent:", job.job_id);
+  console.log("➡️ Job dispatched:", job.job_id);
   res.json(job);
 });
 
+// ✅ Agent reports here
 app.post("/jobs/result", (req, res) => {
   const { job_id, status, output_url, error } = req.body;
-  const matched = activeJobs.find((j) => j.job_id === job_id);
-  const email = matched?.email || "unknown@example.com";
+  const job = activeJobs.find(j => j.job_id === job_id);
 
   completedJobs.push({
     job_id,
     status,
     output_url,
     error,
-    email,
-    timestamp: new Date().toISOString(),
+    email: job?.email,
+    timestamp: new Date()
   });
-  activeJobs = activeJobs.filter((j) => j.job_id !== job_id);
-  res.json({ message: "Result received" });
+
+  activeJobs = activeJobs.filter(j => j.job_id !== job_id);
+  res.json({ ok: true });
 });
 
+// ✅ Frontend upload
 app.post("/jobs/upload", upload.single("job"), async (req, res) => {
   try {
-    if (!drive) throw new Error("Google Drive client not initialized");
+    if (!req.file) {
+      return res.status(400).json({ error: "No ZIP uploaded" });
+    }
 
-    if (!req.file) throw new Error("No file uploaded");
+    const { build_mode = "simulator", email } = req.body;
 
-    const { build_mode = "simulator", webhook_url = null, email = "anonymous@example.com" } = req.body;
+    const fileStream = fs.createReadStream(req.file.path);
 
-    const filePath = req.file.path;
-    console.log("[Upload] File received:", filePath, "size:", req.file.size);
+    const driveFile = await drive.files.create({
+      resource: {
+        name: req.file.originalname,
+        parents: [DRIVE_FOLDER_ID],
+      },
+      media: {
+        mimeType: "application/zip",
+        body: fileStream,
+      },
+      fields: "id",
+    });
 
-    const fileMetadata = {
-      name: req.file.originalname,
-      parents: [DRIVE_FOLDER_ID],
-    };
-    const media = {
-      mimeType: "application/zip",
-      body: fs.createReadStream(filePath),
-    };
-
-    const driveResponse = await drive.files.create({ resource: fileMetadata, media, fields: "id" });
-    const fileId = driveResponse.data.id;
-
-    // Make file publicly downloadable
     await drive.permissions.create({
-      fileId,
+      fileId: driveFile.data.id,
       requestBody: { role: "reader", type: "anyone" },
     });
 
-    const downloadUrl = `https://drive.google.com/uc?id=${fileId}&export=download`;
+    const zipUrl = `https://drive.google.com/uc?id=${driveFile.data.id}&export=download`;
     const jobId = `job_${Date.now()}`;
 
-    const jobData = { job_id: jobId, zip_url: downloadUrl, build_mode, webhook_url, email };
-    pendingJobs.push(jobData);
-    activeJobs.push(jobData);
+    const job = {
+      job_id: jobId,
+      zip_url: zipUrl,
+      build_mode,
+      email,
+    };
 
-    console.log("[Server] New Job Added:", jobId, "for", email);
-    fs.unlinkSync(filePath);
-    res.json({ message: "Job uploaded", job_id: jobId });
-  } catch (err) {
-    console.error("Upload error:", err.message, err.stack);
-    res.status(500).json({ error: err.message || "Failed to upload job" });
+    pendingJobs.push(job);
+    activeJobs.push(job);
+
+    fs.unlinkSync(req.file.path);
+
+    console.log("✅ Job queued:", jobId);
+    res.json({ job_id: jobId });
+
+  } catch (e) {
+    console.error("❌ Upload failed:", e.message);
+    res.status(500).json({ error: e.message });
   }
 });
 
+// ✅ History
 app.get("/jobs/history", (req, res) => {
   const { email } = req.query;
-  if (!email) return res.status(400).json({ message: "Missing email" });
-  const jobs = completedJobs.filter((j) => j.email === email);
-  res.json({ jobs });
+  res.json({
+    jobs: completedJobs.filter(j => j.email === email)
+  });
+});
+
+app.listen(PORT, () => {
+  console.log(`🚀 MacBridge API running on ${PORT}`);
 });
